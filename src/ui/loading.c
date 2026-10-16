@@ -371,6 +371,8 @@ static void loading_advance_step(TAK_Platform *platform) {
         if (TDF_PushSection(tdf, "GlobalHeader") == 0) {
             world->no_sea_level_trigger =
                 TDF_ReadInt(tdf, "nosealeveltrigger", 0) ? 1 : 0;
+            world->lava_world =
+                TDF_ReadInt(tdf, "lavaworld", 0) ? 1 : 0;
             wind_min = TDF_ReadInt(tdf, "minwindspeed", 100);
             wind_max = TDF_ReadInt(tdf, "maxwindspeed", 2000);
             TDF_PopSection(tdf);

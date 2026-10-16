@@ -24,6 +24,12 @@ typedef struct TakSideInfo {
     char resurrectsparkle[32];      /* resurrectsparklygaf */
     char resurrectsparkle_anim[32]; /* resurrectsparklyanim */
     char buildpalette[32];          /* the Intangible Mass colours, "arabipal.pcx" */
+    char nimbus[32];                /* god nimbus GAF stem (legacy:164756) */
+    char stonegaf[32];              /* basilisk stone overlay (legacy:164740) */
+    char stoneanim[32];             /* animation name in stonegaf */
+    char frozengaf[32];             /* ice freeze overlay */
+    char frozenanim[32];            /* animation name in frozengaf */
+    char god[32];                   /* the side's god unitname */
     /* musictracks, the numbers of the Music\TrackN.wav files a battle
      * on this side plays, in a random order (legacy:164711). */
     int  music_tracks[16];

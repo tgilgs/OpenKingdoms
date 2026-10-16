@@ -104,6 +104,7 @@ typedef struct GameWorld {
     MoveInfoTable moveinfo;                         /* LS_LOAD_UNITS  */
     uint32_t     terrain_rgba[256];                 /* LS_LOAD_PALETTE */
     int          water_height;                       /* sidedata waterheight */
+    uint8_t      lava_world;                         /* OTA lavaworld flag  */
     /* Separate palette for feature sprites (lodestones, rocks, trees,
      * lamps). Authored against data/palettes/<kingdom>_features.pcx —
      * NOT the terrain palette. Reusing the terrain palette gives blue-

@@ -117,6 +117,7 @@ static int16_t g_ugrid_head[UGRID_W * UGRID_W];
 static int16_t g_ugrid_next[TAK_MAX_UNITS];
 static int32_t unit_scaled_damage(int shooter, const Unit *victim, int32_t damage);
 static void unit_take_hit(Unit *victim, int shooter, int shooter_player, int32_t damage);
+static void apply_status_effect(Unit *victim, const Projectile *p);
 
 /* Units that came to stand on the map since the grid was built, a
  * spawn or a drop, which a query takes as well: the chains are never
@@ -385,6 +386,8 @@ static void unit_half_extent(const Unit *u, const UnitDef *d, int dflt,
 static int unit_factory_build_spot(Unit *f, int32_t *out_x, int32_t *out_y);
 static int unit_weapon_muzzle(Unit *u, int slot, float *out_dx,
                               float *out_dy, float *out_up);
+static int unit_aim_from(Unit *u, int slot, float *out_dx,
+                         float *out_dy, float *out_up);
 static int unit_sweet_spot_up(Unit *u, float *out_up);
 static void def_body_span(int def_idx, int *lo, int *hi);
 static const UnitDef *def_hull(int def_idx);
@@ -853,6 +856,10 @@ static int g_damage_flame_sprites[3];
 static int g_smoke_loaded;
 static int g_smoke_sprites[2];   /* [0]=white (0x101), [1]=black (0x102) */
 static void tick_attached_flames(void);
+static void emit_smoke_puff(int32_t world_x, int32_t world_y, int32_t height);
+static int  proj_sprite_ensure(SDL_Renderer *r, int idx);
+static void blit_proj_sprite(SDL_Renderer *r, int sprite_idx, int frame,
+                             int sx, int sy);
 
 const ProjectileEffect *Units_GetProjectileEffects(int *out_count) {
     if (out_count) *out_count = g_proj_effect_count;
@@ -1276,6 +1283,11 @@ static int spawn_projectile(int32_t x, int32_t y,
     /* Not a wandering shot until wander_launch says so. */
     p->wander = 0;
     p->wander_steps = 0;
+    /* Smoke trail: copy flags from the weapon. */
+    p->smoke_trail    = source_weapon ? source_weapon->smoke_trail : 0;
+    p->end_smoke      = source_weapon ? source_weapon->end_smoke : 0;
+    p->smoke_interval = source_weapon ? (int16_t)source_weapon->smoke_delay : 8;
+    p->smoke_counter  = p->smoke_interval;
     p->wander_hold = p->wander_pic = 0;
     p->wander_x_fp = p->wander_y_fp = 0;
     p->wander_vx_fp = p->wander_vy_fp = 0;
@@ -1299,6 +1311,8 @@ static int spawn_projectile(int32_t x, int32_t y,
     p->art_kind      = UNIT_WEAPON_ART_NONE;
     p->art_idx       = -1;
     p->explosion_idx = -1;
+    p->water_explosion_idx = -1;
+    p->lava_explosion_idx  = -1;
     p->shadow_idx    = -1;
     p->color_idx     = color_idx;
     p->age_ticks     = 0;
@@ -1374,6 +1388,10 @@ static int spawn_projectile(int32_t x, int32_t y,
                                                     source_weapon->art_name);
         }
         p->explosion_idx = source_weapon->explosion_idx;
+        p->water_explosion_idx = source_weapon->water_explosion_idx;
+        p->lava_explosion_idx  = source_weapon->lava_explosion_idx;
+        p->applies_stone  = source_weapon->applies_stone;
+        p->applies_freeze = source_weapon->applies_freeze;
         g_proj_shake_mag[slot_of_projectile(p)] = source_weapon->shake_magnitude;
         g_proj_shake_sec[slot_of_projectile(p)] = source_weapon->shake_duration;
         p->shadow_idx = source_weapon->shadow_sprite;
@@ -1878,6 +1896,7 @@ static void apply_projectile_area_damage(const Projectile *p) {
                                                 p->edge_effectiveness, d);
         if (damage <= 0) continue;
         unit_take_hit(victim, p->shooter, (int)p->player_id, damage);
+        apply_status_effect(victim, p);
         unit_alarm_on_damage(victim, p->shooter);
         if (victim->health <= 0) {
             credit_kill(p->shooter, (int)p->player_id, victim);
@@ -1999,8 +2018,21 @@ static void projectile_impact_fx(const Projectile *p, const Unit *victim,
     projectile_note_blast(p, victim);
     play_projectile_hit_sound(p, victim);
     projectile_impact_shake(p);
-    spawn_impact_effect(p->explosion_idx, p->world_x, p->world_y,
+    /* Pick water/lava explosion class when available (legacy:250108). */
+    int eidx = p->explosion_idx;
+    if (!victim) {
+        const GameWorld *w = World_Get();
+        if (w && impact_in_water(w, p->world_x, p->world_y)) {
+            if (w->lava_world && p->lava_explosion_idx >= 0)
+                eidx = p->lava_explosion_idx;
+            else if (p->water_explosion_idx >= 0)
+                eidx = p->water_explosion_idx;
+        }
+    }
+    spawn_impact_effect(eidx, p->world_x, p->world_y,
                         (int32_t)p->height, seed);
+    if (p->end_smoke)
+        emit_smoke_puff(p->world_x, p->world_y, (int32_t)p->height);
 }
 
 static int projectile_height_inside_flyer(const Unit *v, float height);
@@ -2053,6 +2085,7 @@ static void projectile_detonate_at(Projectile *p, int idx) {
         Unit *v = &g_units[struck];
         unit_take_hit(v, p->shooter, (int)p->player_id,
                       projectile_base_damage_for_unit(p, v));
+        apply_status_effect(v, p);
         unit_alarm_on_damage(v, p->shooter);
         if (v->health <= 0) {
             credit_kill(p->shooter, (int)p->player_id, v);
@@ -2361,6 +2394,7 @@ static void shot_strike_unit(Projectile *p, int idx, int vi) {
     }
     unit_take_hit(v, p->shooter, (int)p->player_id,
                   projectile_base_damage_for_unit(p, v));
+    apply_status_effect(v, p);
     unit_alarm_on_damage(v, p->shooter);
     if (v->health <= 0) {
         credit_kill(p->shooter, (int)p->player_id, v);
@@ -2631,10 +2665,11 @@ static int beam_ray_walk(Unit *u, int slot, const UnitWeapon *wp,
     ray.player_id = u->player_id;
     ray.path_flags = weapon_path_flags(wp);
     if (!(ray.path_flags & UNIT_PROJ_PATH_TESTED)) return TAK_SHOT_UNIT;
+    /* LOS check originates from the AimFrom piece (legacy:185989). */
     float mdx = 0.0f, mdy = 0.0f, mup = 0.0f;
-    if (!unit_weapon_muzzle(u, slot, &mdx, &mdy, &mup)) {
+    if (!unit_aim_from(u, slot, &mdx, &mdy, &mup)) {
         mdx = mdy = 0.0f;
-        mup = 12.0f;   /* spawn_projectile's clearance with no muzzle */
+        mup = 12.0f;
     }
     int32_t x0 = (int32_t)floorf((float)u->world_x + mdx);
     int32_t y0 = (int32_t)floorf((float)u->world_y + mdy);
@@ -2996,6 +3031,16 @@ static void tick_projectiles(void) {
         } else if (p->gravity_ppt2 > 0.0f && p->speed_ppt > 0.0f) {
             p->pitch = tak_atan2f(p->vel_up_ppt, p->speed_ppt);
         }
+        /* Smoke trail: a puff every smoke_interval ticks along the
+         * flight path (legacy:250038). */
+        if (p->smoke_trail && p->smoke_interval > 0) {
+            p->smoke_counter--;
+            if (p->smoke_counter <= 0) {
+                p->smoke_counter = p->smoke_interval;
+                emit_smoke_puff(p->world_x, p->world_y,
+                                (int32_t)p->height);
+            }
+        }
         /* A shot whose target is gone flies on to whatever it meets. */
         if (tested && p->target >= 0 &&
             (p->target >= g_unit_count || g_units[p->target].alive != 1))
@@ -3053,6 +3098,7 @@ static void tick_projectiles(void) {
                     }
                     unit_take_hit(t, p->shooter, (int)p->player_id,
                                   projectile_base_damage_for_unit(p, t));
+                    apply_status_effect(t, p);
                     unit_alarm_on_damage(t, p->shooter);
                     if (t->health <= 0) {
                         credit_kill(p->shooter, (int)p->player_id, t);
@@ -4632,7 +4678,15 @@ int Units_OrderSetWeaponSlot(int handle, int slot) {
     if (!u) return 0;
     const UnitDef *d = Units_GetDef(u->def_idx);
     if (!d || slot >= d->num_weapons) return 0;
-    u->weapon_slot = (uint8_t)slot;
+    if (u->weapon_slot != (uint8_t)slot) {
+        u->weapon_slot = (uint8_t)slot;
+        /* SwitchWeapon(weapon index): fires once when the active
+         * weapon changes (legacy:233973). */
+        if (u->cob) {
+            int32_t args[1] = { (int32_t)slot };
+            Cob_StartThreadByName(u->cob, "SwitchWeapon", args, 1);
+        }
+    }
     return 1;
 }
 
@@ -7085,6 +7139,7 @@ static int parse_fbi(const char *vfs_path, UnitDef *out) {
     if (TDF_ReadInt(tdf, "weaponswitching",0)) out->cap_flags |= UNIT_CAP_W_SWITCH;
     if (TDF_ReadInt(tdf, "cancapture",     0)) out->cap_flags |= UNIT_CAP_CAPTURE;
     out->cant_be_captured = TDF_ReadInt(tdf, "cantbecaptured", 0) ? 1 : 0;
+    out->cant_be_stoned   = TDF_ReadInt(tdf, "cantbestoned",  0) ? 1 : 0;
     out->heal_time = TDF_ReadFloat(tdf, "healtime", 0.0f);
     if (out->heal_time < 0.0f) out->heal_time = 0.0f;
     if ((out->cap_flags & UNIT_CAP_BUILDER) && out->worker_time > 0.0f) {
@@ -7157,6 +7212,8 @@ static int parse_fbi(const char *vfs_path, UnitDef *out) {
                      TDF_ReadString(tdf, "explosionclass", ""));
         copy_bounded(w->water_explosion_class, sizeof(w->water_explosion_class),
                      TDF_ReadString(tdf, "waterexplosionclass", ""));
+        copy_bounded(w->lava_explosion_class, sizeof(w->lava_explosion_class),
+                     TDF_ReadString(tdf, "lavaexplosionclass", ""));
         copy_bounded(w->weapon_art, sizeof(w->weapon_art),
                      TDF_ReadString(tdf, "weaponart", ""));
         copy_bounded(w->model, sizeof(w->model),
@@ -7212,6 +7269,8 @@ static int parse_fbi(const char *vfs_path, UnitDef *out) {
                      ascii_contains_ci(w->subtype, "turntofrozen")) w->los_kind = 3;
         }
         w->is_los = (w->los_kind != 0);
+        w->applies_stone  = ascii_contains_ci(w->subtype, "turntostone") ? 1 : 0;
+        w->applies_freeze = ascii_contains_ci(w->subtype, "turntofrozen") ? 1 : 0;
         /* emittime is read by the FLAME ctor only (:247444); lightning
          * uses its own short hold (:247096-247133). */
         w->emit_ticks = (w->los_kind == 2)
@@ -7250,6 +7309,7 @@ static int parse_fbi(const char *vfs_path, UnitDef *out) {
         w->drop_key = (uint8_t)(TDF_ReadInt(tdf, "dropped", 0) & 1);
         w->dropped        = ascii_contains_ci(w->subtype, "dropped") ? 1 : 0;
         w->mind_control   = ascii_contains_ci(w->subtype, "mindcontrol") ? 1 : 0;
+        w->nimbus         = TDF_ReadInt(tdf, "nimbus", 0) ? 1 : 0;
         /* Only `type = Ballistic` gets the gravity behaviour; Guided,
          * Line of Sight and Wandering fly flat (legacy:249725-249983).
          * `subtype = Dropped` is its own legacy behaviour object
@@ -7280,6 +7340,10 @@ static int parse_fbi(const char *vfs_path, UnitDef *out) {
         w->veteran_level = TDF_ReadInt(tdf, "veteranlevel", 10);
         /* Bind explosionclass to its effect entry once (legacy:250135). */
         w->explosion_idx = (int16_t)explosion_class_index(w->explosion_class);
+        w->water_explosion_idx = (int16_t)explosion_class_index(
+                                     w->water_explosion_class);
+        w->lava_explosion_idx  = (int16_t)explosion_class_index(
+                                     w->lava_explosion_class);
         w->shake_magnitude = (int16_t)TDF_ReadInt(tdf, "shakemagnitude", 0);
         w->shake_duration  = TDF_ReadFloat(tdf, "shakeduration", 0.0f);
         /* The ground shadow, which legacy loads only when the weapon
@@ -7323,6 +7387,13 @@ static int parse_fbi(const char *vfs_path, UnitDef *out) {
         w->units_only     = (uint8_t)(TDF_ReadInt(tdf, "unitsonly", 0) & 1);
         w->fire_starter   = (uint8_t)(TDF_ReadInt(tdf, "firestarter", 0) & 1);
         w->ground_bounce  = (uint8_t)(TDF_ReadInt(tdf, "groundbounce", 0) & 1);
+        w->rock_unit      = (uint8_t)(TDF_ReadInt(tdf, "rockunit", 0) & 1);
+        w->rock_amount    = TDF_ReadInt(tdf, "recoil", 500);
+        w->smoke_trail    = (uint8_t)(TDF_ReadInt(tdf, "smoketrail", 0) & 1);
+        w->start_smoke    = (uint8_t)(TDF_ReadInt(tdf, "startsmoke", 0) & 1);
+        w->end_smoke      = (uint8_t)(TDF_ReadInt(tdf, "endsmoke", 0) & 1);
+        { int d30 = TDF_ReadInt(tdf, "smokedelay", 4);
+          w->smoke_delay = d30 > 0 ? d30 * 2 : 8; }
         w->path_free      = (ascii_contains_ci(w->type, "remote") ||
                              ascii_contains_ci(w->type, "wandering")) ? 1 : 0;
         /* A Wandering weapon's own keys (legacy:249000-249044). Times
@@ -8931,6 +9002,15 @@ int Units_Spawn(int def_idx, int player_id, int team_color_idx,
                  * etc.) is set before the first frame renders. */
                 Cob_StartThreadByName(u->cob, "Create", NULL, 0);
                 Cob_RunAllThreads(u->cob);
+                /* SetMaxReloadTime(ms): once at setup so scripts can
+                 * time their reload animations (legacy:245687). */
+                for (int wi = 0; wi < def->num_weapons; wi++) {
+                    int32_t ms = (int32_t)(def->weapons[wi].reload_ticks
+                                           * 1000 / 60);
+                    int32_t args[1] = { ms };
+                    Cob_StartThreadByName(u->cob, "SetMaxReloadTime",
+                                          args, 1);
+                }
             }
         }
     }
@@ -9306,7 +9386,27 @@ static int32_t unit_scaled_damage(int shooter, const Unit *victim, int32_t damag
 }
 
 /* A hit lands on `victim`. The battle record notes what it had left to
- * lose, which is all a hit can take off. */
+ * lose, which is all a hit can take off.
+ *
+ * HitByWeapon (legacy:233825): the script hears (damage_class, dx, dz,
+ * amount) once per hit. The damage class is always 0 here because the
+ * field is not parsed yet. dx and dz are the offset from the shooter
+ * to the victim. */
+/* Apply stone/freeze status from a projectile hit (legacy:197875). */
+static void apply_status_effect(Unit *victim, const Projectile *p) {
+    if (!victim || !p || victim->alive != UNIT_ALIVE_ACTIVE) return;
+    if (victim->stoned || victim->frozen) return;
+    const UnitDef *vd = Units_GetDef(victim->def_idx);
+    if (p->applies_stone && !(vd && vd->cant_be_stoned)) {
+        victim->stoned = 1;
+        victim->status_timer = 300;  /* 5 seconds at 60 Hz */
+    }
+    if (p->applies_freeze) {
+        victim->frozen = 1;
+        victim->status_timer = 300;
+    }
+}
+
 static void unit_take_hit(Unit *victim, int shooter, int shooter_player, int32_t damage) {
     int32_t hit = unit_scaled_damage(shooter, victim, damage);
     if (hit > 0)
@@ -9315,6 +9415,15 @@ static void unit_take_hit(Unit *victim, int shooter, int shooter_player, int32_t
         BattleRecord_Hit(shooter_player, victim->player_id,
                          hit < victim->health ? hit : victim->health);
     victim->health -= hit;
+    if (hit > 0 && victim->cob && victim->alive == UNIT_ALIVE_ACTIVE) {
+        int32_t dx = 0, dz = 0;
+        if (shooter >= 0 && shooter < g_unit_count) {
+            dx = victim->world_x - g_units[shooter].world_x;
+            dz = victim->world_y - g_units[shooter].world_y;
+        }
+        int32_t args[4] = { 0, dx, dz, hit };
+        Cob_StartThreadByName(victim->cob, "HitByWeapon", args, 4);
+    }
 }
 
 int32_t Units_HitDamage(int shooter, int victim, int32_t damage) {
@@ -12071,6 +12180,20 @@ static void fire_weapon_shot_now(Unit *u, int shooter_idx, int slot,
     if (run_fire_script) {
         start_fire_script(u, slot);
     }
+    /* Nimbus glow on the caster (legacy:246910). */
+    if (wp->nimbus && u->nimbus_ticks == 0)
+        u->nimbus_ticks = wp->emit_ticks > 0 ? (uint16_t)wp->emit_ticks : 60;
+    /* RockUnit(x, z): recoil impulse once per shot, only when the
+     * weapon sets the flag (legacy:249494-249499). */
+    if (wp->rock_unit && u->cob) {
+        float dh = u->heading - tak_atan2f(
+            (float)(t->world_x - u->world_x),
+            (float)(t->world_y - u->world_y));
+        int32_t rx = (int32_t)(-tak_cosf(dh) * (float)wp->rock_amount);
+        int32_t rz = (int32_t)(-tak_sinf(dh) * (float)wp->rock_amount);
+        int32_t args[2] = { rx, rz };
+        Cob_StartThreadByName(u->cob, "RockUnit", args, 2);
+    }
 
     if (weapon_is_melee(wp)) {
         const UnitDef *td = Units_GetDef(t->def_idx);
@@ -12096,6 +12219,9 @@ static void fire_weapon_shot_now(Unit *u, int shooter_idx, int slot,
 
     const GameWorld *sw = World_Get();
     play_weapon_start_sound(u, wp);
+    if (wp->start_smoke)
+        emit_smoke_puff(u->world_x, u->world_y,
+                        (int32_t)Terrain_SampleHeight(sw, u->world_x, u->world_y));
 
     /* Line-of-Sight: instant ray — damage lands now, the pool entry
      * only holds the beam visual for emittime (legacy :249725). */
@@ -13416,7 +13542,13 @@ static void caster_weapon_fallback(Unit *u, const UnitDef *def) {
         if (mana >= (float)cost) break;
         slot--;
     }
-    u->weapon_slot = (uint8_t)slot;
+    if (u->weapon_slot != (uint8_t)slot) {
+        u->weapon_slot = (uint8_t)slot;
+        if (u->cob) {
+            int32_t args[1] = { (int32_t)slot };
+            Cob_StartThreadByName(u->cob, "SwitchWeapon", args, 1);
+        }
+    }
 }
 
 /* Free self repair (legacy:236281-236286). Every unit and building with
@@ -14025,6 +14157,8 @@ static void Units_TickCombat(void) {
          * re-arms the walk and aim threads, and the death never
          * finishes (#109, legacy:233748). */
         if (u->alive != UNIT_ALIVE_ACTIVE) continue;
+        /* Stone/freeze halts all orders (legacy:197875). */
+        if (u->stoned || u->frozen) continue;
         const UnitDef *def = Units_GetDef(u->def_idx);
         if (!def) continue;
         /* Not built yet: the order is kept but nothing acts on it until
@@ -15262,6 +15396,15 @@ void Units_TickEngines(void) {
                 unit_start_script(u, "WindChange", args, 2);
             }
         }
+        /* Status effect countdown (legacy:197875). */
+        if ((u->stoned || u->frozen) && u->status_timer > 0) {
+            u->status_timer--;
+            if (u->status_timer == 0) {
+                u->stoned = 0;
+                u->frozen = 0;
+            }
+        }
+        if (u->nimbus_ticks > 0) u->nimbus_ticks--;
         Cob_AnimatePieces(u->cob);
         Cob_RunAllThreads(u->cob);
         if (u->alive == UNIT_ALIVE_DYING && u->magic_death) {
@@ -15806,6 +15949,21 @@ static int unit_weapon_muzzle(Unit *u, int slot, float *out_dx,
     return unit_piece_offset(u, qa[0], out_dx, out_dy, out_up);
 }
 
+/* Where a weapon aims from: the piece its AimFrom script names
+ * (legacy:185989). Falls back to the muzzle piece when the script is
+ * absent. */
+static int unit_aim_from(Unit *u, int slot, float *out_dx,
+                         float *out_dy, float *out_up) {
+    if (!u || !u->cob || !u->cob->script) return 0;
+    char name[32];
+    if (!resolve_weapon_script_name(u, "AimFrom", slot, name, sizeof(name)))
+        return unit_weapon_muzzle(u, slot, out_dx, out_dy, out_up);
+    int32_t qa[2] = { 0, slot };
+    if (Cob_RunScriptSync(u->cob, name, qa, 2) != 0)
+        return unit_weapon_muzzle(u, slot, out_dx, out_dy, out_up);
+    return unit_piece_offset(u, qa[0], out_dx, out_dy, out_up);
+}
+
 /* How high on a unit a shot aims: its SweetSpot piece, or piece 0 when
  * the script names none (legacy:186005-186013, :234031-234033). 0 when
  * the unit has no script to ask. */
@@ -15945,6 +16103,23 @@ static void emit_damage_flame(const Unit *u, int node, int32_t type) {
 static int is_smoke_sprite(int si) {
     return g_smoke_loaded &&
            (si == g_smoke_sprites[0] || si == g_smoke_sprites[1]);
+}
+
+/* A smoke puff at a world position — for projectile trails, start
+ * smoke and end smoke. Uses Smoke01 (black) from smoke.gaf. */
+static void emit_smoke_puff(int32_t world_x, int32_t world_y, int32_t height) {
+    load_smoke_sprites();
+    int si = g_smoke_sprites[1];
+    if (si < 0) si = g_smoke_sprites[0];
+    if (si < 0) return;
+    int live = 0;
+    for (int i = 0; i < g_proj_effect_count; i++)
+        if (g_proj_effects[i].alive && is_smoke_sprite(g_proj_effects[i].sprite_idx))
+            live++;
+    if (live >= SMOKE_BUDGET) return;
+    ProjectileEffect *e = spawn_unit_fx_moving(si,
+        world_x, world_y, height, SMOKE_RISE_FP);
+    (void)e;
 }
 
 static void emit_smoke(const Unit *u, int node, int32_t type) {
@@ -16830,6 +17005,96 @@ void Units_RenderBuildGhostFacing(TAK_Platform *plat,
      * batch stretches. Ordering whole batches instead put a tower's
      * masonry over the crew standing in it. */
     emit_height_ordered(plat, m, 1, V);
+
+    /* NoBuild overlay: when the site is blocked, draw a NobuildX sprite
+     * on each footprint cell that individually fails the ground or
+     * occupancy check (legacy:218679). */
+    if (valid == 0 && plat->renderer) {
+        static int s_nobuild = -2;
+        if (s_nobuild == -2)
+            s_nobuild = proj_sprite_index("nobuild", "NobuildX");
+        if (s_nobuild >= 0 &&
+            proj_sprite_ensure(plat->renderer, s_nobuild) == 0) {
+            int nfx, nfz;
+            build_site_cells(def, facing, &nfx, &nfz);
+            uint8_t yard[TAK_YARD_MAX_CELLS];
+            int ycells = build_def_walks(def) ? 0
+                       : Units_ExpandYardmapFacing(def, facing, yard,
+                                                   TAK_YARD_MAX_CELLS);
+            int hw = nfx * 8, hh = nfz * 8;
+            int cx0 = (int)world_x - hw, cy0 = (int)world_y - hh;
+            int sea = world ? world->water_height : 0;
+            int max_slope = def->max_slope;
+            if (max_slope < 0) max_slope = 0;
+            /* Per-cell unit overlap grid, same test build_site_test
+             * uses (legacy:218800-218811). */
+            int sc0 = cx0 / 16, sr0 = cy0 / 16;
+            int reach = unit_max_half_extent() + 16;
+            static int nb_near[TAK_MAX_UNITS];
+            int nn = ugrid_candidates(cx0 - reach, cy0 - reach,
+                                      cx0 + nfx * 16 + reach,
+                                      cy0 + nfz * 16 + reach,
+                                      nb_near, TAK_MAX_UNITS);
+            int walkers = !build_def_walks(def);
+            for (int cz = 0; cz < nfz; cz++) {
+                for (int cx = 0; cx < nfx; cx++) {
+                    int sx = cx0 + cx * 16, sy = cy0 + cz * 16;
+                    int blocked = 0;
+                    if (ycells == 0) {
+                        if (!Terrain_IsWalkable(world, sx, sy,
+                                max_slope > 0 ? max_slope : 255))
+                            blocked = 1;
+                    } else {
+                        uint8_t code = yard[cz * nfx + cx];
+                        if (code == 0) continue;
+                        if ((code & TAK_YARD_BLOCK) &&
+                            !Terrain_IsWalkable(world, sx, sy, 255))
+                            blocked = 1;
+                        if (!blocked && (code & TAK_YARD_WATER) && sea > 0) {
+                            int lo, hi;
+                            cell_height_span(world, sx, sy, &lo, &hi);
+                            if (hi > sea) blocked = 1;
+                        }
+                    }
+                    /* Unit overlap check per cell. */
+                    if (!blocked) {
+                        int uc = sc0 + cx, ur = sr0 + cz;
+                        for (int k = 0; k < (nn < 0 ? g_unit_count : nn); k++) {
+                            const Unit *uu = &g_units[nn < 0 ? k : nb_near[k]];
+                            if (uu->alive != 1) continue;
+                            const UnitDef *ud = Units_GetDef(uu->def_idx);
+                            if (ud && ud->can_fly &&
+                                !unit_is_mobile_occupant(uu, ud)) continue;
+                            if (!walkers && build_def_walks(ud)) continue;
+                            int ufx2, ufz2;
+                            if (unit_def_is_structure(ud)) {
+                                ufx2 = ud->footprint_x > 0 ? ud->footprint_x : 2;
+                                ufz2 = ud->footprint_z > 0 ? ud->footprint_z : 2;
+                                if (uu->facing & 1) { int t2 = ufx2; ufx2 = ufz2; ufz2 = t2; }
+                            } else {
+                                unit_occ_fp(uu, &ufx2, &ufz2);
+                            }
+                            int uc2 = floor_div16(uu->world_x - ufx2 * 8 + 8);
+                            int ur2 = floor_div16(uu->world_y - ufz2 * 8 + 8);
+                            if (uc >= uc2 && uc < uc2 + ufx2 &&
+                                ur >= ur2 && ur < ur2 + ufz2) {
+                                blocked = 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (!blocked) continue;
+                    /* Project cell centre to screen and blit. */
+                    int cellx = sx + 8;
+                    int celly = sy + 8;
+                    int ch = Terrain_SampleHeight(world, cellx, celly);
+                    int bx = cellx - (int)cam_x;
+                    int by = celly - (int)cam_y - (int)((float)ch * tilt);
+                    blit_proj_sprite(plat->renderer, s_nobuild, 0, bx, by);
+                }
+            }
+        }
+    }
 }
 
 /* Walk Y-sorted draw order, group consecutive units sharing
@@ -18827,6 +19092,39 @@ void Units_Render(const struct GameWorld *world, TAK_Platform *plat) {
     render_projectiles(world, plat);
     render_projectile_effects(world, plat);
     render_construction_effects(world, plat);
+    /* Nimbus glow on units casting a nimbus weapon. */
+    if (plat->renderer) {
+        for (int i = 0; i < g_unit_count; i++) {
+            const Unit *nu = &g_units[i];
+            if (nu->nimbus_ticks == 0 || nu->alive != UNIT_ALIVE_ACTIVE) continue;
+            if (!Fog_ShowsAt(world, nu->world_x, nu->world_y)) continue;
+            const UnitDef *nd = Units_GetDef(nu->def_idx);
+            if (!nd) continue;
+            const TakSideInfo *ns = Sides_Get(Sides_FindByPrefix(nd->side));
+            if (!ns || !ns->nimbus[0]) continue;
+            static int s_nimbus_cache[TAK_SIDES_MAX];
+            static int s_nimbus_init = 0;
+            if (!s_nimbus_init) {
+                for (int k = 0; k < TAK_SIDES_MAX; k++) s_nimbus_cache[k] = -2;
+                s_nimbus_init = 1;
+            }
+            int si = Sides_FindByPrefix(nd->side);
+            if (si < 0 || si >= TAK_SIDES_MAX) continue;
+            if (s_nimbus_cache[si] == -2)
+                s_nimbus_cache[si] = proj_sprite_index(ns->nimbus, ns->nimbus);
+            int nsi = s_nimbus_cache[si];
+            if (nsi < 0) continue;
+            if (proj_sprite_ensure(plat->renderer, nsi) != 0) continue;
+            const ProjSpriteArt *nps = &g_proj_sprites[nsi];
+            if (nps->num_frames <= 0) continue;
+            int nframe = (nu->nimbus_ticks / 2) % nps->num_frames;
+            int nx = nu->world_x - world->cam_x;
+            int ny = nu->world_y - world->cam_y
+                   - (int)((float)Terrain_SampleHeight(world, nu->world_x, nu->world_y)
+                           * g_tan_tilt);
+            blit_proj_sprite(plat->renderer, nsi, nframe, nx, ny);
+        }
+    }
 }
 
 /* ── Accessors for a second view (tak_unit.h) ────────────────────── */

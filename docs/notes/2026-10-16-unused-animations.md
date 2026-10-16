@@ -21,11 +21,10 @@ Used by the original for weapon `smoketrail` puffs (one puff every
 `smokedelay` frames along a projectile's flight path), `startsmoke` (a puff
 at the muzzle on fire), and `endsmoke` (a puff at the impact point).
 
-Engine location: `src/render/units.c` projectile tick loop (~line 2100-2260).
+Engine location: `src/render/units.c` projectile tick loop.
 Weapon TDF fields `smoketrail`, `smokedelay`, `startsmoke`, `endsmoke` are
-documented in docs/notes/2026-09-04-rendering-visuals.md but not parsed.
-Add fields to UnitWeaponDef in `include/tak_unit.h`, parse in the weapon
-loader (~line 5950), and spawn smoke puffs in the projectile step function.
+parsed and emitted as Smoke01 puffs along the flight path, at the muzzle,
+and at the impact point.
 
 ### Flame (in use)
 
@@ -119,12 +118,12 @@ Both sequences are in use.
   - `redshot` (10 frames) -- red projectile hit
   - `parablast` (8 frames) -- parabolic blast
 
-Engine location: `src/render/units.c` `load_explosion_classes` (~line 885)
-parses `gamedata/explosions/explosions.tdf`. `spawn_impact_effect` (~line
-1011) draws the sprite at impact. Weapons bind via `explosionclass`,
-`waterexplosionclass`, `lavaexplosionclass` in weapon TDF. The loader and
-impact renderer are in place. Water and lava explosion variants are parsed
-but the water/lava surface detection to pick them is not built.
+Engine location: `src/render/units.c` `load_explosion_classes` parses
+`gamedata/explosions/explosions.tdf`. `spawn_impact_effect` draws the sprite
+at impact. Weapons bind via `explosionclass`, `waterexplosionclass`,
+`lavaexplosionclass` in weapon TDF. Water surface detection picks
+`waterexplosionclass` for shots landing on water without a victim. Lava
+detection is not yet built.
 
 ### flameburst.gaf
 
@@ -214,15 +213,6 @@ in `transportfx.gaf`.
 ## Weapon visual features not yet implemented
 
 These weapon TDF flags are parsed by the original but not yet drawn:
-
-- `smoketrail` + `smokedelay`: periodic smoke puffs along a projectile path.
-  Engine: add fields to UnitWeaponDef (`include/tak_unit.h`), parse in the
-  weapon loader (`src/render/units.c` ~line 5950), draw in the projectile
-  step loop (~line 2100-2260).
-- `startsmoke`: a smoke puff at the weapon's muzzle on firing. Engine:
-  spawn in the projectile launch function (~line 1060-1180).
-- `endsmoke`: a smoke puff at the impact point. Engine: spawn in
-  `shot_burst` (~line 1954).
 - `nimbus`: a glowing aura on the god unit while a spell weapon fires.
   Engine: draw in the per-unit render pass, keyed by the side-data nimbus
   field parsed from `gamedata/sidedata.tdf` (`src/game/sides.c`).
@@ -247,13 +237,13 @@ Side data (`gamedata/sidedata.tdf`) names these per-faction effects:
 | Transport swirl | Done | `TransSwirl` |
 | Mind-control spin | Done | `mindspin` |
 | Flame particles | Done | `flame` |
-| Projectile smoke trails | Not implemented | `Smoke01`, `Smoke02` |
-| Invalid placement indicator | Not implemented | `NobuildX` |
+| Projectile smoke trails | Done | `Smoke01`, `Smoke02` |
+| Invalid placement indicator | Done | `NobuildX` |
 | Building damage fires | Partially done | `flames.gaf` (11 variants) |
-| Weapon explosion classes | Loaded, not all drawn | `fx.gaf` (30 entries) |
+| Weapon explosion classes | Water variant done, lava pending | `fx.gaf` (30 entries) |
 | Magic rings / blue fire | Not implemented | `rings.gaf` (7 entries) |
-| God nimbus glow | Not implemented | Per-side nimbus |
-| Frozen/stone overlays | Not implemented | Per-side GAFs |
+| God nimbus glow | Done (render) | Per-side nimbus |
+| Frozen/stone overlays | Done (gameplay + status) | Per-side GAFs |
 | Projectile shadows | Done | Per-weapon `shadowgaf` |
 | Crystal ball scrying | Not implemented | `CrystalBallEffect` |
 | Radiance auras | Not implemented | `radiated.gaf` (5 entries) |

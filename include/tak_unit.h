@@ -145,8 +145,9 @@ typedef struct UnitWeapon {
     char    type[32];          /* type: Ballistic, Line of Sight, Remote Effect */
     char    damage_type[32];   /* damagetype */
     char    explosion_class[32]; /* explosionclass */
-    /* waterexplosionclass, read for a host's look. The simulation never reads it. */
+    /* waterexplosionclass and lavaexplosionclass (legacy:250108-250115). */
     char    water_explosion_class[32];
+    char    lava_explosion_class[32];
     char    weapon_art[32];    /* weaponart */
     char    model[32];         /* model projectile 3DO basename */
     char    subtype[32];       /* subtype for spell/special rules */
@@ -163,6 +164,9 @@ typedef struct UnitWeapon {
      * 3 = instant effect with no projectile of its own. */
     uint8_t los_kind;
     uint8_t is_los;             /* los_kind != 0 */
+    uint8_t applies_stone;      /* subtype turntostone */
+    uint8_t applies_freeze;     /* subtype turntofrozen */
+    uint8_t nimbus;             /* nimbus weapon flag */
     int32_t emit_ticks;          /* emittime (30Hz frames) → 60Hz ticks */
     uint8_t beam_inner[3];       /* innercolor RGB */
     uint8_t beam_middle[3];      /* middlecolor RGB */
@@ -227,6 +231,8 @@ typedef struct UnitWeapon {
     char    veteran_art_name[32];
     int32_t veteran_level;
     int16_t explosion_idx;    /* explosionclass slot, -1 = none */
+    int16_t water_explosion_idx;  /* waterexplosionclass, -1 = none */
+    int16_t lava_explosion_idx;   /* lavaexplosionclass, -1 = none */
     /* shakemagnitude in pixels and shakeduration in seconds: the view
      * shakes where a shot of this weapon lands (legacy:250066). */
     int16_t shake_magnitude;
@@ -254,6 +260,18 @@ typedef struct UnitWeapon {
     int16_t hover_attack_dist;
     int16_t hover_attack_alt;
     uint8_t drop_key;
+    /* RockUnit: the script hears a recoil impulse on each shot
+     * (legacy:249494-249499). The magnitude is the TDF value. */
+    uint8_t rock_unit;
+    int32_t rock_amount;
+    /* Smoke puffs along a projectile's flight path (legacy:250038).
+     * smoketrail enables the trail, smokedelay is the interval in
+     * 30 Hz frames. startsmoke and endsmoke spawn one puff at the
+     * muzzle and impact respectively. */
+    uint8_t smoke_trail;
+    uint8_t start_smoke;
+    uint8_t end_smoke;
+    int32_t smoke_delay;       /* interval in 60 Hz ticks */
     /* Button icon JPEG names (no extension, no path) — resolve to
      * `data/anims/weaponpic/<lowercased>.jpg`. The legacy engine reads
      * these `buttonimage*` fields from the inline [WEAPONn] section
@@ -316,6 +334,8 @@ typedef struct Projectile {
     uint8_t  color_idx;           /* owner team colour (legacy:249446)  */
     int16_t  art_idx;             /* art cache slot, -1 = unresolved    */
     int16_t  explosion_idx;       /* explosionclass slot, -1 = none     */
+    int16_t  water_explosion_idx; /* waterexplosionclass, -1 = none     */
+    int16_t  lava_explosion_idx;  /* lavaexplosionclass, -1 = none      */
     int16_t  shadow_idx;          /* ground shadow sprite, -1 = none    */
     uint8_t  hidden;              /* a spell's shot, drawn by effects  */
     /* TAK_SHOT_* weapon flags (tak_shot_path.h) plus
@@ -323,6 +343,9 @@ typedef struct Projectile {
     uint8_t  path_flags;
     /* UNIT_BLAST_*: what the shot's blast does to scenery. */
     uint8_t  blast_flags;
+    /* Status effect the weapon applies on hit. */
+    uint8_t  applies_stone;       /* turntostone subtype */
+    uint8_t  applies_freeze;      /* turntofrozen subtype */
     /* A Wandering shot (legacy:249059-249174), stepped once a frame:
      * its UNIT_WANDER_* phase, the picture and hold of the art it
      * shows, its 16.16 position and velocity, the velocity it set out
@@ -340,6 +363,12 @@ typedef struct Projectile {
     uint32_t wander_seed;
     int32_t  wander_left, wander_turn, wander_every;
     int16_t  wander_art[3];       /* start, loop, end sprite slots      */
+    /* Smoke trail (legacy:250038): a puff every smoke_interval ticks.
+     * smoke_counter counts down to the next puff. */
+    uint8_t  smoke_trail;
+    uint8_t  end_smoke;
+    int16_t  smoke_interval;
+    int16_t  smoke_counter;
 } Projectile;
 
 /* The phases of a Wandering shot: one frame waiting on its caster, its
@@ -489,6 +518,8 @@ typedef struct UnitDef {
     /* cantbecaptured (legacy:163021): mind control neither aims at
      * this unit nor takes it. */
     int32_t  cant_be_captured;
+    /* cantbestoned: immune to basilisk stone (legacy:163050). */
+    uint8_t  cant_be_stoned;
     int32_t  transported_size; /* transportedsize override when carried */
     int32_t  transport_distance; /* transportdistance; load/unload radius */
     char     movement_class[32];/* movementclass key into moveinfo.tdf */
@@ -954,6 +985,15 @@ typedef struct Unit {
     /* The death weapon a dying unit bursts with when its death ends,
      * 1 + its index in death_weapons, 0 for none (legacy:227346-227349). */
     uint8_t    death_blast;
+    /* Status effects: stone and freeze (legacy:197875-197886). The
+     * timer counts down at 60 Hz; the overlay texture is forced while
+     * the flag is set. */
+    uint8_t    stoned;            /* petrified by a turntostone weapon */
+    uint8_t    frozen;            /* frozen by a turntofrozen weapon   */
+    uint16_t   status_timer;      /* ticks remaining on stone/freeze   */
+    /* Nimbus glow: ticks remaining of the glow drawn at the unit's
+     * feet when a nimbus weapon fires (legacy:246910). */
+    uint16_t   nimbus_ticks;
     /* Flight. A flyer takes off when it gets something to do and lands
      * when it goes idle (legacy:24117, legacy:24302). flight_alt is the
      * height above the ground it is drawn and hit at; sfx_occupy is the
