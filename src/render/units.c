@@ -2227,6 +2227,12 @@ static void def_body_span(int def_idx, int *lo, int *hi) {
     *hi = d->body_top_px;
 }
 
+int Units_DefModelHeight(int def_idx) {
+    int lo, hi;
+    def_body_span(def_idx, &lo, &hi);
+    return hi > 0 ? hi : 32;
+}
+
 /* A unit's base and the span of its model in whole px: the base is
  * where the original's ground test starts (legacy:236955-236958), the
  * bottom where its air test does (legacy:245431). */
@@ -3005,9 +3011,11 @@ static void tick_projectiles(void) {
             if (last) p->alive = 0;
             continue;
         }
-        /* A ballistic ground shot tests the ground under it on every
-         * step from its first (legacy:245377-245475, :246654-246668). */
-        if (p->target < 0 && p->gravity_ppt2 > 0.0f && gw) {
+        /* A ballistic shot tests the ground under it on every step
+         * (legacy:245377-245475, :246654-246668). A ground shot and a
+         * dropped bomb both detonate on contact; a ground shot has
+         * no target, a dropped bomb still carries one. */
+        if (p->gravity_ppt2 > 0.0f && gw) {
             int g = shell_meets_ground(gw, p);
             if (g < 0) { p->alive = 0; continue; }
             if (g > 0) { projectile_detonate(p, i); continue; }
@@ -7254,10 +7262,9 @@ static int parse_fbi(const char *vfs_path, UnitDef *out) {
          * Line of Sight and Wandering fly flat (legacy:249725-249983).
          * `subtype = Dropped` is its own legacy behaviour object
          * (legacy:249743) that derives the horizontal run from the fall
-         * time instead of solving a launch; until that lands the egg
-         * bombs keep flying flat. */
-        w->is_gravity     = (ascii_contains_ci(w->type, "ballistic") &&
-                             !w->dropped) ? 1 : 0;
+         * time instead of solving a launch; the bomb keeps the
+         * carrier's heading and falls under gravity. */
+        w->is_gravity     = ascii_contains_ci(w->type, "ballistic") ? 1 : 0;
         /* Resolve the art once: model 3DO, else weaponart GAF, else the
          * held beam for the lightning/flame LOS subtypes. Retail data
          * never sets both keys on one weapon. */

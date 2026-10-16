@@ -1424,36 +1424,28 @@ Format per entry:
 - Citation: none. The manual does not describe the menu at this
   level. Issue #212 carries the measurements.
 
-## D-014: Sight does not grow or shrink with the ground it falls on
+## D-014: Sight grows and shrinks with terrain height
 
-- Change: a unit reveals every fog cell inside its sightdistance,
-  plus the nine cells around it. The height of the ground plays no
-  part in what is revealed.
-- Why: the original scales the radius by height instead of blocking
-  on it. It takes the unit's eye, which is its position plus the
-  height of its model, subtracts the lowest ground in the cell it is
-  lighting, and multiplies by sightdistance over the model height
-  times 32. A cell whose ground stands above the eye is not lit at
-  all, and the whole thing is capped at twice sightdistance
-  (legacy:167413-167423). On level ground the model height cancels
-  and the radius is exactly sightdistance, which is what we compute,
-  so we match the original wherever the ground is flat. On a slope we
-  differ: the original sees further downhill and less far uphill.
-  The term needs the height of the unit's 3DO, which the original
-  keeps on the unit type at +0x14c and fills from the model at load,
-  and a record of the ground under each fog cell, which the original
-  builds from the heightmap in projected screen space
-  (legacy:224395-224470). The simulation now reads a unit's model file
-  itself, apart from the renderer, for the span a shot strikes
-  (docs/notes/2026-09-27-shots-meet-what-they-fly-into.md), so the
-  model is no longer out of its reach. The ground record, and the
-  stamp that reads both, are still to be written.
-  The same number drives the third trigger on the original's
-  re-stamp, which fires when the unit's eye moves by more than 5
-  (legacy:167455-167456). With no eye height there is nothing for
-  that trigger to watch, so our reveal is re-stamped on a fog cell
-  change alone.
-- Citation: the manual is silent on sight at this level of detail.
+- Change: two complementary mechanisms match the original. First,
+  per-cell height scaling (legacy:167413-167423): the effective
+  sight for a fog cell is sightdistance times (eye minus cell
+  ground) divided by model height, capped at twice sightdistance.
+  The eye is the terrain under the unit plus the model top. A cell
+  whose ground stands above the eye is not lit. On flat ground the
+  model height cancels and the result is exactly sightdistance.
+  Second, height-compensated cell coordinates (legacy:208685,
+  :208695, :250583-250596): the fog cell Z is shifted by half the
+  terrain height, fogCellZ = (worldZ - h/2) / cellSize, so the
+  expanded circle is placed correctly in the isometric projection.
+  Queries (overlay, visibility, landing fog gate) use the same
+  compensated mapping so the drawn fog matches the simulation.
+- Why: the original scales sight by height and shifts the fog cell.
+  A unit on a hilltop sees up to twice as far across low ground.
+  The per-cell ground map is built once at fog init from the
+  heightmap.
+- Citation: legacy:167413-167423 the height term. legacy:208685,
+  :208695 the compensated cell. legacy:224395-224470 the ground
+  record. The manual is silent on sight at this level.
 ## D-015: The sweep clears a building you own
 
 - Change: with the broom armed, a click on a building of your own
@@ -1728,9 +1720,9 @@ Format per entry:
   it picked as soon as that target is out of its reach or inside its
   minrange, and neither its search nor its return fire takes one there.
 - Why: shots stop on what they fly into now, and the original fires
-  into a hill without looking first. Its sight also shrinks uphill
-  (D-014), which the engine does not copy yet, so here a unit sees and
-  picks a target up a slope that the original's would not have seen.
+  into a hill without looking first. Sight now shrinks uphill
+  (D-014), so the leash covers the mismatch between what a unit
+  sees and what its shot can reach.
   Without this an archer in a forest clearing, or a tower inside a
   castle, fires into the trees or the wall until its target dies and
   never turns to anything it could hit.

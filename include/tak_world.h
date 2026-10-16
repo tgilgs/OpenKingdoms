@@ -251,6 +251,7 @@ typedef struct GameWorld {
 
     uint8_t   *fog_state;                         /* player-1 compatibility alias */
     uint8_t   *fog_layers[TAK_MAX_PLAYERS + 1];   /* 1-based player fog layers */
+    int16_t   *fog_ground;                         /* per-cell ground height */
     int        fog_w;
     int        fog_h;
     int        fog_cell_px;

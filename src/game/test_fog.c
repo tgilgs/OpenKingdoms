@@ -22,6 +22,12 @@ const UnitDef *Units_GetDef(int idx) {
     return &g_test_defs[idx];
 }
 
+int Units_DefModelHeight(int def_idx) {
+    if (def_idx < 0 || def_idx >= 4) return 32;
+    int h = g_test_defs[def_idx].body_top_px;
+    return h > 0 ? h : 32;
+}
+
 /* The reveal anchor. It is simulation state on the unit rather than a
  * cache, so fog.c asks the unit layer for it and this fixture owns the
  * unit array. Same rule as the real one: the anchor follows the unit
@@ -41,20 +47,22 @@ void Units_FogAnchor(int handle, int sight, int32_t *out_x, int32_t *out_y) {
     if (out_y) *out_y = u->fog_y;
 }
 
-/* A terrain the stamp is not supposed to read. The ridge is a band
- * of high ground between two x values, and every query is counted
- * so a test can assert the stamp made none. */
-static int g_ridge_x0, g_ridge_x1, g_ridge_h, g_terrain_queries;
+/* A terrain stub: height is g_ridge_h inside the rectangle
+ * [g_ridge_x0..g_ridge_x1) × [g_ridge_y0..g_ridge_y1), zero outside.
+ * Every query is counted so a test can assert the stamp made none. */
+static int g_ridge_x0, g_ridge_x1, g_ridge_h;
+static int g_ridge_y0, g_ridge_y1;
+static int g_terrain_queries;
 
 int Terrain_SampleHeight(const GameWorld *world,
                          int32_t world_x, int32_t world_y) {
     (void)world;
-    (void)world_y;
     g_terrain_queries++;
-    if (g_ridge_x1 > g_ridge_x0 &&
-        world_x >= g_ridge_x0 && world_x < g_ridge_x1)
-        return g_ridge_h;
-    return 0;
+    if (g_ridge_x1 <= g_ridge_x0) return 0;
+    if (world_x < g_ridge_x0 || world_x >= g_ridge_x1) return 0;
+    if (g_ridge_y1 > g_ridge_y0 &&
+        (world_y < g_ridge_y0 || world_y >= g_ridge_y1)) return 0;
+    return g_ridge_h;
 }
 
 #define ASSERT_EQ_INT(exp, got) do { \
@@ -349,7 +357,9 @@ static int test_an_ai_teammate_grants_no_sight(void) {
 
 /* The original's stamp walks fog cells and consults nothing between
  * the unit's cell and the cell it lights (legacy:167396-167427), so
- * a ridge hides nothing behind it. */
+ * a ridge hides nothing behind it. The height term scales the range
+ * per cell (legacy:167413-167423), so a tall unit on low ground
+ * still sees the flat ground beyond a ridge. */
 static int test_a_ridge_does_not_hide_the_ground_behind_it(void) {
     GameWorld w;
     memset(&w, 0, sizeof(w));
@@ -358,14 +368,16 @@ static int test_a_ridge_does_not_hide_the_ground_behind_it(void) {
     w.map_pixels_w = 512;
     w.map_pixels_h = 512;
     w.cfg.line_of_sight = 1;
-    ASSERT_EQ_INT(0, Fog_Init(&w));
+    /* The ridge exists during init so fog_ground records it. */
     g_ridge_x0 = 96;
     g_ridge_x1 = 128;
-    g_ridge_h = 200;
+    g_ridge_h = 40;
+    ASSERT_EQ_INT(0, Fog_Init(&w));
     g_terrain_queries = 0;
 
     g_test_unit_count = 1;
     g_test_defs[0].sight_distance = 256;
+    g_test_defs[0].body_top_px = 50;
     g_test_units[0].alive = UNIT_ALIVE_ACTIVE;
     g_test_units[0].player_id = 1;
     g_test_units[0].def_idx = 0;
@@ -373,17 +385,18 @@ static int test_a_ridge_does_not_hide_the_ground_behind_it(void) {
     g_test_units[0].world_y = 272;
     Fog_Update(&w, 1);
 
-    /* The unit's own cell and the ridge it stands against. */
+    /* The unit's own cell and the ridge it stands against. The eye
+     * (0 + 50 = 50) is above the ridge (40), so the ridge cell is
+     * lit at reduced range: eff = 256 * (50-40)/50 = 51. One cell
+     * away (32 px) is within 51, so it shows. */
     ASSERT_EQ_INT(TAK_FOG_VISIBLE, Fog_StateAtForPlayer(&w, 1, 80, 272));
     ASSERT_EQ_INT(TAK_FOG_VISIBLE, Fog_StateAtForPlayer(&w, 1, 112, 272));
-    /* Ground beyond the ridge, 4 and 6 cells out of the 8 the
-     * radius buys. */
+    /* Flat ground beyond the ridge: eff = 256 * 50/50 = 256, same
+     * as flat-ground sight. 4 and 6 cells out are within range. */
     ASSERT_EQ_INT(TAK_FOG_VISIBLE, Fog_StateAtForPlayer(&w, 1, 208, 272));
     ASSERT_EQ_INT(TAK_FOG_VISIBLE, Fog_StateAtForPlayer(&w, 1, 272, 272));
-    /* 11 cells out, past the radius. */
+    /* 11 cells out, past the full radius. */
     ASSERT_EQ_INT(TAK_FOG_UNEXPLORED, Fog_StateAtForPlayer(&w, 1, 432, 272));
-    /* The stamp asked the terrain nothing at all. */
-    ASSERT_EQ_INT(0, g_terrain_queries);
 
     g_ridge_x0 = g_ridge_x1 = g_ridge_h = 0;
     Fog_Free(&w);
@@ -508,6 +521,72 @@ static int test_a_watcher_sees_the_whole_map_and_no_seat_changes(void) {
     return 0;
 }
 
+/* A unit on high ground sees further across low ground than a unit on
+ * flat ground does (legacy:167413-167423, :208685). The per-cell
+ * height term scales sight by (eye - cell_ground) / model_height,
+ * capped at 2× sight. The compensated fog cell mapping shifts the
+ * stamp centre so the expanded circle is placed correctly in the
+ * isometric projection. */
+static int test_a_unit_on_high_ground_sees_further(void) {
+    GameWorld w;
+    memset(&w, 0, sizeof(w));
+    memset(g_test_units, 0, sizeof(g_test_units));
+    memset(g_test_defs, 0, sizeof(g_test_defs));
+    w.map_pixels_w = 1024;
+    w.map_pixels_h = 1024;
+    w.cfg.line_of_sight = 1;
+    /* A plateau at x=[0,160) y=[200,320) at height 120, flat at 0. */
+    g_ridge_x0 = 0;  g_ridge_x1 = 160;
+    g_ridge_y0 = 200; g_ridge_y1 = 320;
+    g_ridge_h = 120;
+    ASSERT_EQ_INT(0, Fog_Init(&w));
+
+    g_test_unit_count = 1;
+    g_test_defs[0].sight_distance = 192;
+    g_test_defs[0].body_top_px = 32;
+    g_test_units[0].alive = UNIT_ALIVE_ACTIVE;
+    g_test_units[0].player_id = 1;
+    g_test_units[0].def_idx = 0;
+    /* Unit on the plateau at (80, 256). Height 120, model 32,
+     * eye = 152. Compensated fog cell: (2, (256-60)/32) = (2, 6).
+     *
+     * For flat-ground cells (h=0): eff = 192 * 152/32 = 912 → 384.
+     * For plateau cells (h=120): eff = 192 * 32/32 = 192.
+     *
+     * South along fog x=2 toward flat ground (y >= 320, h=0):
+     * cell (2, fy) has dy = fy-6. Lit when dy*32 ≤ 384 → dy ≤ 12.
+     * fy ≤ 18, world y = 576. */
+    g_test_units[0].world_x = 80;
+    g_test_units[0].world_y = 256;
+    Fog_Update(&w, 1);
+
+    /* The plateau unit reaches flat ground at y=576 (fog cell 18,
+     * dy=12, d=384 = 2× sight). */
+    ASSERT_EQ_INT(TAK_FOG_VISIBLE,
+                  Fog_StateAtForPlayer(&w, 1, 80, 576));
+    /* One cell further south: dy=13, d=416 > 384. Past range. */
+    ASSERT_EQ_INT(TAK_FOG_UNEXPLORED,
+                  Fog_StateAtForPlayer(&w, 1, 80, 608));
+
+    /* Move to flat ground at (512, 256). Height 0, eye = 32.
+     * eff = 192 * 32/32 = 192. Compensated cy = 256/32 = 8.
+     * dy ≤ 6 → fy ≤ 14, world y = 448. */
+    g_test_units[0].world_x = 512;
+    g_test_units[0].world_y = 256;
+    Fog_Update(&w, 1);
+    ASSERT_EQ_INT(TAK_FOG_VISIBLE,
+                  Fog_StateAtForPlayer(&w, 1, 512, 448));
+    /* dy=7, d=224 > 192. Past range on flat ground. */
+    ASSERT_EQ_INT(TAK_FOG_UNEXPLORED,
+                  Fog_StateAtForPlayer(&w, 1, 512, 480));
+
+    g_ridge_x0 = g_ridge_x1 = g_ridge_h = 0;
+    g_ridge_y0 = g_ridge_y1 = 0;
+    Fog_Free(&w);
+    g_test_unit_count = 0;
+    return 0;
+}
+
 int main(void) {
     int failed = 0;
     failed |= test_map_revealed_initializes_explored();
@@ -521,6 +600,7 @@ int main(void) {
     failed |= test_the_nine_cells_around_a_unit_are_always_lit();
     failed |= test_the_reveal_follows_the_unit_across_a_cell_boundary();
     failed |= test_a_watcher_sees_the_whole_map_and_no_seat_changes();
+    failed |= test_a_unit_on_high_ground_sees_further();
     if (failed) return 1;
     puts("test_fog: ok");
     return 0;

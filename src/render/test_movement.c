@@ -1828,9 +1828,16 @@ TEST(the_landing_test_is_the_originals) {
     for (int i = 0; i < w->fog_w * w->fog_h; i++)
         w->fog_layers[1][i] = TAK_FOG_EXPLORED;
     ASSERT_EQ_INT(0, Units_DebugCanLandAt(drag, 800, 1504));
-    /* The fog cell read is the footprint's middle one, from its origin. */
+    /* The fog cell read is the footprint's middle one, from its origin.
+     * Fog uses height-compensated Z (legacy:208685), so the cell index
+     * shifts by half the terrain height at the query point. */
     int ftx = ((800 - 32 + 8) >> 4), ftz = ((1504 - 32 + 8) >> 4);
-    w->fog_layers[1][((ftz >> 1) + 1) * w->fog_w + (ftx >> 1) + 1] = TAK_FOG_UNEXPLORED;
+    int qx = ((ftx >> 1) + 1) * TAK_FOG_CELL_PX;
+    int qy = ((ftz >> 1) + 1) * TAK_FOG_CELL_PX;
+    int th = Terrain_SampleHeight(w, qx, qy);
+    int fog_fx = qx / TAK_FOG_CELL_PX;
+    int fog_fy = (qy - th / 2) / TAK_FOG_CELL_PX;
+    w->fog_layers[1][fog_fy * w->fog_w + fog_fx] = TAK_FOG_UNEXPLORED;
     ASSERT_EQ_INT(1, Units_DebugCanLandAt(drag, 800, 1504));
     mv_end();
 }

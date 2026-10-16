@@ -1461,6 +1461,11 @@ void              Units_DebugSetAggro(int handle, int aggro_mode);
  * floater or wading hover unit at its waterline (legacy:234287-234330). */
 float             Units_DrawnAlt(const struct GameWorld *w, const Unit *u);
 
+/* The top of a def's 3DO model in px above the unit's base. Used by
+ * the fog stamp to compute how far the unit sees from a height
+ * (legacy:167413-167423, deviation D-014). */
+int               Units_DefModelHeight(int def_idx);
+
 /* Test hook: the height a unit stands at for the simulation, its shots
  * and the shots aimed at it. -1 for a bad handle. */
 float             Units_DebugStandHeight(int handle);

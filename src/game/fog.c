@@ -1,6 +1,7 @@
 #include "tak_fog.h"
 #include "tak_world.h"
 #include "tak_unit.h"
+#include "tak_terrain.h"
 #include "tak_memory.h"
 #include <SDL.h>
 #include <stdlib.h>
@@ -27,6 +28,11 @@
 static int fog_idx(const GameWorld *w, int x, int y) {
     return y * w->fog_w + x;
 }
+
+static void fog_cell_compensated(const GameWorld *w,
+                                 int32_t world_x, int32_t world_y,
+                                 int *out_fx, int *out_fy);
+
 
 /* Per-unit reveal cache (see Fog_Update). Keyed by unit handle; a
  * reused handle recomputes on the position test. */
@@ -67,8 +73,8 @@ static const uint8_t *fog_layer_const(const GameWorld *world, int player_id) {
  * of Sight, so with it off explored ground stays clear (legacy:130175,
  * legacy:130295-130305). Off-map reads as unexplored, matching the
  * legacy edge handling. */
-static uint8_t fog_corner_alpha(const GameWorld *world,
-                                const uint8_t *layer, int cx, int cy) {
+static uint8_t fog_cell_alpha(const GameWorld *world,
+                              const uint8_t *layer, int cx, int cy) {
     if (cx < 0 || cy < 0 || cx >= world->fog_w || cy >= world->fog_h)
         return 0xFF;
     switch (layer[fog_idx(world, cx, cy)]) {
@@ -76,6 +82,16 @@ static uint8_t fog_corner_alpha(const GameWorld *world,
         case TAK_FOG_EXPLORED: return world->cfg.line_of_sight ? 0x78 : 0x00;
         default:               return 0xFF;
     }
+}
+
+/* Height-compensated corner alpha: the world position maps through the
+ * same compensated cell index the stamp uses (legacy:208685). */
+static uint8_t fog_corner_alpha(const GameWorld *world,
+                                const uint8_t *layer,
+                                int32_t world_x, int32_t world_y) {
+    int cx, cy;
+    fog_cell_compensated(world, world_x, world_y, &cx, &cy);
+    return fog_cell_alpha(world, layer, cx, cy);
 }
 
 /* A watcher sees the whole map. Viewer 0 has no fog layer, and every
@@ -87,8 +103,7 @@ uint8_t Fog_OverlayAlphaAt(const GameWorld *world, int32_t world_x, int32_t worl
     if (g_fog_see_all) return 0x00;
     const uint8_t *layer = world->fog_layers[Fog_Viewer()];
     if (!layer) return 0xFF;
-    int cx = world_x / world->fog_cell_px, cy = world_y / world->fog_cell_px;
-    return fog_corner_alpha(world, layer, cx, cy);
+    return fog_corner_alpha(world, layer, world_x, world_y);
 }
 
 int Fog_Init(GameWorld *world) {
@@ -109,6 +124,18 @@ int Fog_Init(GameWorld *world) {
                world->cfg.map_revealed ? TAK_FOG_EXPLORED : TAK_FOG_UNEXPLORED,
                n);
     }
+    /* Per-cell ground height for the height-scaled sight term
+     * (legacy:224395-224470). Each cell stores the terrain height
+     * at its centre so the stamp can compare eye vs ground. */
+    world->fog_ground = (int16_t *)tak_malloc(n * sizeof(int16_t));
+    if (world->fog_ground) {
+        for (int fy = 0; fy < world->fog_h; fy++)
+            for (int fx = 0; fx < world->fog_w; fx++)
+                world->fog_ground[fy * world->fog_w + fx] =
+                    (int16_t)Terrain_SampleHeight(world,
+                        fx * FOG_CELL_PX + FOG_CELL_PX / 2,
+                        fy * FOG_CELL_PX + FOG_CELL_PX / 2);
+    }
     world->fog_state = world->fog_layers[1];
     fog_cache_reset();
     g_fog_world = world;
@@ -122,25 +149,57 @@ void Fog_Free(GameWorld *world) {
         if (world->fog_layers[p]) tak_free(world->fog_layers[p]);
         world->fog_layers[p] = NULL;
     }
+    if (world->fog_ground) tak_free(world->fog_ground);
+    world->fog_ground = NULL;
     world->fog_state = NULL;
     world->fog_w = world->fog_h = world->fog_cell_px = 0;
     if (g_fog_world == world) g_fog_world = NULL;
 }
 
+/* Height-compensated fog cell coordinate (legacy:208685, :208695,
+ * :250583-250596). The original maps world Z into fog Z by subtracting
+ * half the terrain height, so high ground shifts the fog cell and a
+ * unit on a hill sees further in the downhill direction. The fog array
+ * stays a flat world-space grid; the compensation enters only when
+ * computing the cell index for the stamp or a query point. */
+static void fog_cell_compensated(const GameWorld *w,
+                                 int32_t world_x, int32_t world_y,
+                                 int *out_fx, int *out_fy) {
+    int h = Terrain_SampleHeight(w, world_x, world_y);
+    *out_fx = world_x / FOG_CELL_PX;
+    *out_fy = (world_y - h / 2) / FOG_CELL_PX;
+}
+
 /* The original's fog stamp, LOS_UpdateArea (legacy:167323). It works
  * in fog cells: the unit's cell, the cell being lit, and the squared
  * distance between the two indices (legacy:167401). The nine cells
- * around the unit are lit whatever the radius buys
- * (legacy:167402), and every other cell has to sit within
- * sightdistance, which at 32 px a cell is 1024 * d2 <= sight * sight
- * (legacy:167422 on level ground). Nothing between the two cells is
- * read: terrain blocks no sight in the original. D-014 records the
- * height term we leave out. */
-static int fog_cell_lit(int dx, int dy, int sight) {
+ * around the unit are lit whatever the radius buys (legacy:167402).
+ *
+ * Per-cell height scaling (legacy:167413-167423): the effective sight
+ * for a cell is sightdistance * (eye - cell_ground) / model_height,
+ * capped at twice sightdistance. The eye is the terrain under the
+ * unit plus the model's top. A cell whose ground stands above the
+ * eye is not lit. On flat ground the model height cancels and the
+ * result is exactly sightdistance.
+ *
+ * The height compensation (legacy:208685) shifts the fog cell Z
+ * coordinate; the per-cell scaling adjusts the radius. Together
+ * they give the correct fog shape on sloped terrain. */
+static int fog_cell_lit(int dx, int dy, int sight,
+                        int eye_h, int cell_ground, int model_h) {
     int d2 = dx * dx + dy * dy;
     if (d2 < 3) return 1;
+    /* Height-scaled effective sight (legacy:167413-167423). */
+    int eff = sight;
+    if (model_h > 0) {
+        int dh = eye_h - cell_ground;
+        if (dh <= 0) return 0;
+        eff = sight * dh / model_h;
+        if (eff > sight * 2) eff = sight * 2;
+        if (eff <= 0) return 0;
+    }
     return (int64_t)d2 * (int64_t)(FOG_CELL_PX * FOG_CELL_PX) <=
-           (int64_t)sight * (int64_t)sight;
+           (int64_t)eff * (int64_t)eff;
 }
 
 /* The original gives a unit's sight to an ally's map at the moment it
@@ -214,12 +273,21 @@ void Fog_Update(GameWorld *world, int player_id) {
             continue;
         }
 
-        /* The unit's own fog cell is where the original measures
-         * from (legacy:167450-167453). One cell of slack on the box
-         * covers the nine always-lit cells of a short-sighted unit. */
-        int cx0 = ax / FOG_CELL_PX;
-        int cy0 = ay / FOG_CELL_PX;
-        int reach = sight / FOG_CELL_PX + 1;
+        /* The unit's fog cell uses the height-compensated Z
+         * (legacy:208685, :208695). On high ground the cell shifts,
+         * so the stamp circle reaches further downhill. */
+        int cx0, cy0;
+        fog_cell_compensated(world, ax, ay, &cx0, &cy0);
+
+        /* Eye height: terrain under the unit plus model top
+         * (legacy:167413). Model height defaults to 32 if unknown. */
+        int unit_ground = Terrain_SampleHeight(world, ax, ay);
+        int model_h = Units_DefModelHeight((int)u->def_idx);
+        int eye_h = unit_ground + model_h;
+
+        /* The reach covers 2× sight (the height cap) plus one cell
+         * of slack for the nine always-lit cells (legacy:167402). */
+        int reach = (sight * 2) / FOG_CELL_PX + 1;
         int min_x = cx0 - reach;
         int max_x = cx0 + reach;
         int min_y = cy0 - reach;
@@ -241,7 +309,10 @@ void Fog_Update(GameWorld *world, int player_id) {
         }
         for (int fy = min_y; fy <= max_y; fy++) {
             for (int fx = min_x; fx <= max_x; fx++) {
-                if (!fog_cell_lit(fx - cx0, fy - cy0, sight)) continue;
+                int cell_ground = world->fog_ground
+                    ? world->fog_ground[fy * world->fog_w + fx] : unit_ground;
+                if (!fog_cell_lit(fx - cx0, fy - cy0, sight,
+                                  eye_h, cell_ground, model_h)) continue;
                 int idx = fog_idx(world, fx, fy);
                 layer[idx] = TAK_FOG_VISIBLE;
                 if (c && c->cells && cn < c->cap) c->cells[cn++] = idx;
@@ -262,8 +333,8 @@ int Fog_StateAtForPlayer(const GameWorld *world, int player_id,
     const uint8_t *layer = fog_layer_const(world, player_id);
     if (!world || !layer)
         return TAK_FOG_VISIBLE;
-    int fx = world_x / FOG_CELL_PX;
-    int fy = world_y / FOG_CELL_PX;
+    int fx, fy;
+    fog_cell_compensated(world, world_x, world_y, &fx, &fy);
     if (fx < 0 || fy < 0 || fx >= world->fog_w || fy >= world->fog_h)
         return TAK_FOG_UNEXPLORED;
     return layer[fog_idx(world, fx, fy)];
@@ -394,10 +465,12 @@ void Fog_RenderOverlay(const GameWorld *world, TAK_Platform *plat) {
 
     for (int cy = c0y; cy <= c1y; cy++) {
         for (int cx = c0x; cx <= c1x; cx++) {
-            uint8_t a00 = fog_corner_alpha(world, layer, cx,     cy);
-            uint8_t a10 = fog_corner_alpha(world, layer, cx + 1, cy);
-            uint8_t a11 = fog_corner_alpha(world, layer, cx + 1, cy + 1);
-            uint8_t a01 = fog_corner_alpha(world, layer, cx,     cy + 1);
+            int32_t wx0 = cx * cell, wy0 = cy * cell;
+            int32_t wx1 = wx0 + cell, wy1 = wy0 + cell;
+            uint8_t a00 = fog_corner_alpha(world, layer, wx0, wy0);
+            uint8_t a10 = fog_corner_alpha(world, layer, wx1, wy0);
+            uint8_t a11 = fog_corner_alpha(world, layer, wx1, wy1);
+            uint8_t a01 = fog_corner_alpha(world, layer, wx0, wy1);
             if ((a00 | a10 | a11 | a01) == 0) continue;   /* all clear */
 
             int sx = cx * cell + half - world->cam_x;
